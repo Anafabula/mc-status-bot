@@ -1,74 +1,49 @@
+use std::sync::Arc;
+
+use anyhow::anyhow;
 use anyhow::Context as _;
 use async_minecraft_ping::ConnectionConfig;
-use serenity::async_trait;
-use serenity::builder::CreateEmbed;
-use serenity::builder::CreateEmbedFooter;
-use serenity::model::gateway::Ready;
-use serenity::model::prelude::interaction::Interaction;
-use serenity::model::prelude::interaction::InteractionResponseType;
-use serenity::model::prelude::GuildId;
-use serenity::prelude::*;
+use poise::serenity_prelude::CreateEmbed;
+use poise::serenity_prelude::CreateEmbedFooter;
+use poise::serenity_prelude::GatewayIntents;
+use poise::Framework;
 use shuttle_secrets::SecretStore;
 use tracing::{error, info};
 
-struct Bot {
-    discord_guild_id: GuildId,
+struct Data {
+    // User data, which is stored and accessible in all command invocations
     mc_server: (String, u16),
 }
+type Error = Box<dyn std::error::Error + Send + Sync>;
+type Context<'a> = poise::Context<'a, Data, Error>;
 
-#[async_trait]
-impl EventHandler for Bot {
-    async fn ready(&self, ctx: Context, ready: Ready) {
-        info!("{} is connected!", ready.user.name);
+struct PoiseService<T, E> {
+    framework: Arc<Framework<T, E>>,
+}
 
-        let commands =
-            GuildId::set_application_commands(&self.discord_guild_id, &ctx.http, |commands| {
-                commands.create_application_command(|command| {
-                    command.name("status").description("Get Server Status")
-                })
-            })
+#[shuttle_service::async_trait]
+impl<
+        T: std::marker::Send + std::marker::Sync + 'static,
+        E: std::marker::Send + std::marker::Sync + 'static,
+    > shuttle_service::Service for PoiseService<T, E>
+{
+    async fn bind(
+        mut self: Box<Self>,
+        _addr: std::net::SocketAddr,
+    ) -> Result<(), shuttle_service::error::Error> {
+        self.framework
+            .start()
             .await
-            .unwrap();
+            .map_err(shuttle_service::error::CustomError::new)?;
 
-        info!("Registered commands: {:#?}", commands);
-    }
-
-    async fn interaction_create(&self, ctx: Context, interaction: Interaction) {
-        if let Interaction::ApplicationCommand(command) = interaction {
-            let response_content = match command.data.name.as_str() {
-                "status" => {
-                    match get_server_status(&__self.mc_server.0, __self.mc_server.1).await {
-                        Ok(message) => message,
-                        Err(err) => {
-                            error!(?err, "Error while getting data from the MC server");
-                            CreateEmbed::default()
-                                .description(err.to_string())
-                                .to_owned()
-                        }
-                    }
-                }
-                command => unreachable!("Unknown command: {}", command),
-            };
-
-            let create_interaction_response =
-                command.create_interaction_response(&ctx.http, |response| {
-                    response
-                        .kind(InteractionResponseType::ChannelMessageWithSource)
-                        .interaction_response_data(|message| message.add_embed(response_content))
-                });
-
-            if let Err(why) = create_interaction_response.await {
-                eprintln!("Cannot respond to slash command: {}", why);
-            }
-        }
+        Ok(())
     }
 }
 
 #[shuttle_service::main]
 async fn serenity(
     #[shuttle_secrets::Secrets] secret_store: SecretStore,
-) -> shuttle_service::ShuttleSerenity {
-    // Get the discord token set in `Secrets.toml`
+) -> Result<PoiseService<Data, Error>, shuttle_service::Error> {
     let discord_token = secret_store
         .get("DISCORD_TOKEN")
         .context("'DISCORD_TOKEN' was not found")?;
@@ -79,27 +54,53 @@ async fn serenity(
 
     let mc_server_port = secret_store
         .get("MC_SERVER_PORT")
-        .and_then(|s| s.parse().ok())
+        .and_then(|s| s.parse::<u16>().ok())
         .context("'MC_SERVER_PORT' was not found")?;
 
-    let discord_guild_id = secret_store
-        .get("DISCORD_GUILD_ID")
-        .and_then(|s| s.parse().ok())
-        .context("'DISCORD_GUILD_ID' was not found")?;
-
-    // Set gateway intents, which decides what events the bot will be notified about.
-    // Here we don't need any intents so empty
-    let intents = GatewayIntents::empty();
-
-    let client = Client::builder(discord_token, intents)
-        .event_handler(Bot {
-            mc_server: (mc_server_addr, mc_server_port),
-            discord_guild_id: GuildId(discord_guild_id),
+    let framework = poise::Framework::builder()
+        .options(poise::FrameworkOptions {
+            commands: vec![status()],
+            ..Default::default()
         })
+        .token(discord_token)
+        .intents(GatewayIntents::empty())
+        .setup(move |ctx, _ready, framework| {
+            Box::pin(async move {
+                poise::builtins::register_globally(ctx, &framework.options().commands).await?;
+                Ok(Data {
+                    mc_server: (mc_server_addr, mc_server_port),
+                })
+            })
+        })
+        .build()
         .await
-        .expect("Err creating client");
+        .map_err(|err| {
+            error!("Error building poise framework: {err}");
+            anyhow!(err)
+        })?;
 
-    Ok(client)
+    Ok(PoiseService { framework })
+}
+
+#[poise::command(slash_command)]
+async fn status(ctx: Context<'_>) -> Result<(), Error> {
+    let data = ctx.data();
+    let embed = match get_server_status(&data.mc_server.0, data.mc_server.1).await {
+        Ok(message) => message,
+        Err(err) => {
+            error!("Error while getting data from the MC server: {err}");
+            CreateEmbed::default()
+                .description(err.to_string())
+                .to_owned()
+        }
+    };
+    info!("Replying with embed: {embed:?}");
+    ctx.send(|m| {
+        m.embeds.push(embed);
+        m
+    })
+    .await?;
+    Ok(())
 }
 
 async fn get_server_status(
@@ -136,19 +137,6 @@ async fn get_server_status(
     let start = tokio::time::Instant::now();
     connection.ping(299792458).await?;
     let latency = start.elapsed();
-
-    // let message = serde_json::json!({
-    //     "embeds": [
-    //         {
-    //             "type": "rich",
-    //             "title": desc,
-    //             "description": format!("Players ({}/{}):\n{}", playercount.0, playercount.1, players),
-    //             "footer": {
-    //                 "text": format!("Ping: {} ms", latency.as_millis())
-    //             }
-    //         }
-    //     ]
-    // });
 
     let mut embed = CreateEmbed::default();
 
